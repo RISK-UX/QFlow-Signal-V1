@@ -4,7 +4,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 from pathlib import Path
-DB=os.getenv('DATABASE_URL',''); PASSWORD=os.getenv('ADMIN_PASSWORD',''); WEBHOOK=os.getenv('WEBHOOK_SECRET',''); KEY=os.getenv('OPENAI_API_KEY',''); SESSIONS={}
+DB=os.getenv('DATABASE_URL',''); PASSWORD=os.getenv('ADMIN_PASSWORD',''); WEBHOOK=os.getenv('WEBHOOK_SECRET',''); KEY=os.getenv('OPENAI_API_KEY','').strip(); SESSIONS={}
 CATS=['Lead Response','Follow-Up','BDC Operations','Appointment Setting','No-Shows','Dormant Lead Reactivation','CRM Problems','Human Handoff','AI / Automation','Internet Sales','Unsold Opportunities','Lead Source Quality','Sales Process','Vendor Recommendation','Other Automotive']
 def connect():
  if DB:
@@ -36,7 +36,21 @@ def analyze(s):
    with urllib.request.urlopen(req,timeout=25) as r: a=json.loads(json.load(r)['choices'][0]['message']['content'])
    assert isinstance(a['automotive'],bool) and isinstance(a['categories'],list) and isinstance(a['why'],str) and isinstance(a['draft'],str)
    out={**a,'score':max(0,min(100,int(a['score']))),'categories':[c for c in a['categories'] if c in CATS],'mode':'LLM'}
-  except Exception: out['mode']='rule-based fallback (AI unavailable)'
+  except urllib.error.HTTPError as e:
+   code=''
+   try:
+    detail=json.loads(e.read(16384)).get('error',{})
+    candidate=detail.get('code') or detail.get('type') or ''
+    if isinstance(candidate,str) and re.fullmatch(r'[a-zA-Z0-9_]{1,80}',candidate): code=candidate
+   except Exception: pass
+   out['mode']='rule-based fallback (OpenAI HTTP '+str(e.code)+(' '+code if code else '')+')'
+   print(out['mode'],flush=True)
+  except (urllib.error.URLError,TimeoutError):
+   out['mode']='rule-based fallback (OpenAI network or timeout)'
+   print(out['mode'],flush=True)
+  except Exception as e:
+   out['mode']='rule-based fallback (OpenAI response error: '+type(e).__name__+')'
+   print(out['mode'],flush=True)
  if not out['automotive']: out['score']=min(49,out['score']); out['draft']=''
  return out
 def ingest(p):
