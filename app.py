@@ -1,4 +1,5 @@
-import os, json, sqlite3, hmac, secrets, time, urllib.request, re, html
+import os, json, sqlite3, hmac, secrets, time, urllib.request, re, html, hashlib, math
+from urllib.parse import urlencode
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from datetime import datetime, timezone
@@ -50,6 +51,32 @@ def ingest(p):
 def seed():
  titles=['BDC has 3,000 old leads untouched','GM looking for dealership AI follow-up software','Dealership CRM duplicate follow-up every day','Dealer: how do you handle appointment no-shows?','Internet sales manager: how fast is lead response time?','Dealership CRM recommendations?','Which car should I buy?','Mechanic discussing brake repairs','Dealership Facebook leads never answer','Dealer principal: how to reactivate dormant leads?']
  for i,t in enumerate(titles): ingest({'id':f'mock-{i+1}','subreddit':'askcarsales','title':t,'body':t,'author':f'demo_operator_{i+1}','url':'https://www.reddit.com/r/askcarsales/','source':'mock','keyword':'lead' if 'lead' in t else ''})
+def prowlo_sync(watcher_id=''):
+ key=os.getenv('PROWLO_API_KEY','')
+ if not key: raise ValueError('PROWLO_API_KEY is not configured')
+ params={'view':'matched','platforms':'reddit','limit':10}
+ if watcher_id: params['watcher_id']=watcher_id
+ req=urllib.request.Request('https://api.prowlo.com/v1/records?'+urlencode(params),headers={'Authorization':'Bearer '+key})
+ with urllib.request.urlopen(req,timeout=15) as r: payload=json.load(r)
+ if not payload.get('success'): raise RuntimeError('Prowlo API failed')
+ items=payload['data']['items']; imported=0; skipped=0
+ for item in items:
+  if item.get('platform')!='reddit' or item.get('verification')=='coincidental' or not item.get('id'): skipped+=1; continue
+  sid='prowlo-'+str(item['id'])
+  if sql('SELECT payload FROM signals WHERE id=?',(sid,),True): skipped+=1; continue
+  try:
+   ingest({'id':sid,'subreddit':item.get('subreddit') or '', 'title':item.get('title') or '', 'body':(item.get('body') or item.get('snippet') or '')[:30000], 'author':item.get('author') or '[unknown]', 'url':item.get('permalink') or '', 'timestamp':item.get('redditCreatedAt') or '', 'source':'Prowlo'})
+   imported+=1
+  except ValueError: skipped+=1
+ return {'imported':imported,'skipped':skipped,'more_available':bool(payload['data'].get('nextCursor'))}
+def signed_prowlo(headers,raw):
+ secret=os.getenv('PROWLO_WEBHOOK_SECRET','')
+ ts=headers.get('Prowlo-Timestamp',''); sig=headers.get('Prowlo-Signature','')
+ try: fresh=math.isfinite(float(ts)) and abs(time.time()-float(ts))<=300
+ except ValueError: fresh=False
+ if not secret or not fresh or not sig.startswith('v1='): return False
+ expected='v1='+hmac.new(secret.encode(),ts.encode()+b'.'+raw,hashlib.sha256).hexdigest()
+ return hmac.compare_digest(sig,expected)
 class Handler(BaseHTTPRequestHandler):
  def send(self,code,data,typ='application/json',headers={}):
   b=(json.dumps(data) if typ=='application/json' else data).encode(); self.send_response(code); self.send_header('Content-Type',typ); self.send_header('Cache-Control','no-store'); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'");
@@ -67,14 +94,26 @@ class Handler(BaseHTTPRequestHandler):
   return self.send(404,{'error':'Not found'})
  def do_POST(self):
   try:
-   n=int(self.headers.get('Content-Length','0')); assert 0<n<=1000000; p=json.loads(self.rfile.read(n)); path=urlparse(self.path).path
+   n=int(self.headers.get('Content-Length','0')); assert 0<n<=1000000; raw=self.rfile.read(n); p=json.loads(raw); path=urlparse(self.path).path
    if path=='/api/login':
     if not PASSWORD or not hmac.compare_digest(str(p.get('password','')),PASSWORD): return self.send(401,{'error':'Invalid login'})
     token=secrets.token_urlsafe(32); SESSIONS[token]=time.time()+43200; return self.send(200,{'ok':True},headers={'Set-Cookie':'qflow='+token+'; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200'+('; Secure' if os.getenv('RENDER') else '')})
    if path=='/api/webhooks/prowlo':
+    if self.headers.get('Prowlo-Signature') is not None:
+     if not signed_prowlo(self.headers,raw): return self.send(401,{'error':'Invalid signature or timestamp'})
+     if p.get('type') not in ('crawl.run.completed','alert.fired'): return self.send(400,{'error':'Unsupported event'})
+     if p.get('data',{}).get('errored'): return self.send(200,{'ignored':'crawl error'})
+     if not os.getenv('PROWLO_API_KEY'): return self.send(503,{'error':'PROWLO_API_KEY missing'})
+     return self.send(200,prowlo_sync(str(p.get('data',{}).get('watcher_id') or '')))
     if not WEBHOOK or not hmac.compare_digest(self.headers.get('Authorization',''),'Bearer '+WEBHOOK): return self.send(401,{'error':'Unauthorized webhook'})
     return self.send(200,ingest(p))
    if not self.auth(): return self.send(401,{'error':'Login required'})
+   if path=='/api/test-ai':
+    s=ingest({'id':'mock-ai-'+secrets.token_hex(8),'subreddit':'askcarsales','title':'Dealership BDC overwhelmed by 800 internet leads monthly','body':'Synthetic test: our dealership CRM has thousands of dormant leads and growing appointment no-shows. Has anyone implemented AI follow-up?','author':'synthetic_test','url':'https://www.reddit.com/r/askcarsales/','source':'mock'})
+    return self.send(200,{'mode':s['mode'],'score':s['score'],'why':s['why']})
+   if path=='/api/prowlo-sync':
+    if not os.getenv('PROWLO_API_KEY'): return self.send(400,{'error':'PROWLO_API_KEY is not configured'})
+    return self.send(200,prowlo_sync())
    if path=='/api/seed': seed(); return self.send(200,{'ok':True})
    if path=='/api/settings':
     s={'threshold':max(50,min(100,int(p['threshold']))),'subreddits':str(p['subreddits']),'keywords':str(p['keywords'])}; sql('INSERT INTO settings (id,payload) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload',('main',json.dumps(s))); return self.send(200,s)
