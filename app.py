@@ -1,4 +1,4 @@
-import os, json, sqlite3, hmac, secrets, time, urllib.request, re, html, hashlib, math
+import os, json, sqlite3, hmac, secrets, time, urllib.request, urllib.error, re, html, hashlib, math
 from urllib.parse import urlencode
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
@@ -51,15 +51,25 @@ def ingest(p):
 def seed():
  titles=['BDC has 3,000 old leads untouched','GM looking for dealership AI follow-up software','Dealership CRM duplicate follow-up every day','Dealer: how do you handle appointment no-shows?','Internet sales manager: how fast is lead response time?','Dealership CRM recommendations?','Which car should I buy?','Mechanic discussing brake repairs','Dealership Facebook leads never answer','Dealer principal: how to reactivate dormant leads?']
  for i,t in enumerate(titles): ingest({'id':f'mock-{i+1}','subreddit':'askcarsales','title':t,'body':t,'author':f'demo_operator_{i+1}','url':'https://www.reddit.com/r/askcarsales/','source':'mock','keyword':'lead' if 'lead' in t else ''})
+class ProwloError(Exception): pass
 def prowlo_sync(watcher_id=''):
- key=os.getenv('PROWLO_API_KEY','')
+ key=os.getenv('PROWLO_API_KEY','').strip()
  if not key: raise ValueError('PROWLO_API_KEY is not configured')
  params={'view':'matched','platforms':'reddit','limit':10}
  if watcher_id: params['watcher_id']=watcher_id
  req=urllib.request.Request('https://api.prowlo.com/v1/records?'+urlencode(params),headers={'Authorization':'Bearer '+key})
- with urllib.request.urlopen(req,timeout=15) as r: payload=json.load(r)
- if not payload.get('success'): raise RuntimeError('Prowlo API failed')
- items=payload['data']['items']; imported=0; skipped=0
+ try:
+  with urllib.request.urlopen(req,timeout=15) as r: payload=json.load(r)
+ except urllib.error.HTTPError as e:
+  raise ProwloError('Prowlo API HTTP '+str(e.code)+('; check API key in Railway' if e.code==401 else '')) from None
+ except (urllib.error.URLError, TimeoutError):
+  raise ProwloError('Prowlo network connection or timeout') from None
+ except ValueError:
+  raise ProwloError('Prowlo returned invalid JSON') from None
+ if not isinstance(payload,dict) or not payload.get('success'): raise ProwloError('Prowlo API returned an unsuccessful response')
+ data=payload.get('data'); items=data.get('items') if isinstance(data,dict) else None
+ if not isinstance(items,list): raise ProwloError('Unexpected Prowlo records response format')
+ imported=0; skipped=0
  for item in items:
   if item.get('platform')!='reddit' or item.get('verification')=='coincidental' or not item.get('id'): skipped+=1; continue
   sid='prowlo-'+str(item['id'])
@@ -122,8 +132,11 @@ class Handler(BaseHTTPRequestHandler):
     if not r: return self.send(404,{'error':'Unknown signal'})
     s=json.loads(r[0][0]); action=p['action']; assert action in ['approve','ignore','edit']; s['draft']=str(p.get('draft',s['draft']))[:4000]; s['status']={'approve':'approved','ignore':'ignored','edit':s['status']}[action]; s['reason']=str(p.get('reason',''))[:200]; save(s); return self.send(200,s)
    return self.send(404,{'error':'Not found'})
+  except ProwloError as e: return self.send(502,{'error':str(e)})
   except (ValueError,KeyError,AssertionError,TypeError): return self.send(400,{'error':'Invalid request'})
-  except Exception: return self.send(500,{'error':'Internal error'})
+  except Exception as e:
+   print('Request failure:',type(e).__name__,flush=True)
+   return self.send(500,{'error':'Internal error ('+type(e).__name__+')'})
 if __name__=='__main__':
  if not PASSWORD or not WEBHOOK: raise SystemExit('Set ADMIN_PASSWORD and WEBHOOK_SECRET first')
  init(); ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','8000'))),Handler).serve_forever()
